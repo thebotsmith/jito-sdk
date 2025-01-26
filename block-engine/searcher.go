@@ -20,7 +20,7 @@ func NewSearcherClient(
 	ctx context.Context,
 	grpcAddr string,
 	jitoRPCClient, rpcClient *rpc.Client,
-	keyPair *solana.PrivateKey,
+	keyPair solana.PrivateKey,
 	opts ...grpc.DialOption,
 ) (*SearcherClient, error) {
 	// Channel to handle errors during gRPC connection setup
@@ -34,18 +34,11 @@ func NewSearcherClient(
 
 	// Create a new SearcherServiceClient with the established connection
 	searcherService := searcher_pb.NewSearcherServiceClient(conn)
-	var authService *pkg.AuthenticationService
 
 	// Set up authentication if a keyPair is provided
-	if keyPair != nil {
-		authService = pkg.NewAuthenticationService(context.Background(), conn, keyPair)
-		if err = authService.AuthenticateAndRefresh(auth_pb.Role_SEARCHER); err != nil {
-			return nil, err
-		}
-	} else {
-		authService = &pkg.AuthenticationService{
-			GRPCCtx: ctx,
-		}
+	authService := pkg.NewAuthenticationService(context.Background(), conn, &keyPair)
+	if err = authService.AuthenticateAndRefresh(auth_pb.Role_SEARCHER); err != nil {
+		return nil, err
 	}
 
 	// Subscribe to bundle results if authentication is set up
@@ -65,6 +58,45 @@ func NewSearcherClient(
 		JitoRPCConn:              jitoRPCClient,
 		SearcherService:          searcherService,
 		AuthenticationService:    authService,
+		BundleStreamSubscription: subBundleRes,
+		ErrChan:                  chErr,
+	}, nil
+}
+
+func NewSearcherClientNoAuth(
+	ctx context.Context,
+	grpcAddr string,
+	jitoRPCClient, rpcClient *rpc.Client,
+	opts ...grpc.DialOption,
+) (*SearcherClient, error) {
+	// Channel to handle errors during gRPC connection setup
+	chErr := make(chan error)
+
+	// Create a new gRPC connection using the provided address and options
+	conn, err := pkg.CreateGRPCConnection(ctx, chErr, grpcAddr, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a new SearcherServiceClient with the established connection
+	searcherService := searcher_pb.NewSearcherServiceClient(conn)
+
+	// Subscribe to bundle results
+	var subBundleRes searcher_pb.SearcherService_SubscribeBundleResultsClient
+	subBundleRes, err = searcherService.SubscribeBundleResults(ctx, &searcher_pb.SubscribeBundleResultsRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("could not perform bundle results subscription: %w", err)
+	}
+
+	// Return the initialized SearcherClient
+	return &SearcherClient{
+		GRPCConn:        conn,
+		RPCConn:         rpcClient,
+		JitoRPCConn:     jitoRPCClient,
+		SearcherService: searcherService,
+		AuthenticationService: &pkg.AuthenticationService{
+			GRPCCtx: ctx,
+		},
 		BundleStreamSubscription: subBundleRes,
 		ErrChan:                  chErr,
 	}, nil
