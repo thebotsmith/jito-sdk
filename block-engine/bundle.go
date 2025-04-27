@@ -102,7 +102,9 @@ func (c *SearcherClient) SendBundleWithConfirmation(
 		return nil, err
 	}
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	fmt.Printf("tx (%s) sent...", signature)
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	// Create channels to handle the normal check and additional check
 	normalCheckDone := make(chan *BundleResponse, 1)
@@ -179,11 +181,11 @@ func (c *SearcherClient) SendBundleWithConfirmation(
 			}
 
 			if out.Value != nil {
+				reachBlockChain = true
 				confirmed := false
 				for _, status := range out.Value {
 					if status != nil && status.ConfirmationStatus == "processed" && !reachBlockChain {
 						reachBlockChain = true
-						log.Print("tx sent:", signature)
 					}
 
 					if status != nil && status.ConfirmationStatus == "confirmed" {
@@ -204,6 +206,9 @@ func (c *SearcherClient) SendBundleWithConfirmation(
 					}
 					return
 				}
+			} else if len(out.Value) == 0 || out.Value[0] == nil {
+				additionalCheckDone <- nil
+				return
 			}
 
 			// Wait for a short delay before retrying
