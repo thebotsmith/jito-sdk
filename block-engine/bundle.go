@@ -16,7 +16,7 @@ import (
 
 // Constants for retry and timeout configurations
 const (
-	CheckBundleRetries               = 5                // Number of times to retry checking bundle status
+	CheckBundleRetries               = 10               // Number of times to retry checking bundle status
 	CheckBundleRetryDelay            = 2 * time.Second  // Delay between retries for checking bundle status
 	SignaturesConfirmationTimeout    = 15 * time.Second // Timeout for confirming signatures
 	SignaturesConfirmationRetryDelay = 1 * time.Second  // Delay between retries for confirming signatures
@@ -95,6 +95,7 @@ func (c *SearcherClient) SendBundleWithConfirmation(
 	signature *solana.Signature,
 	opts ...grpc.CallOption,
 ) (*BundleResponse, error) {
+	var reachBlockChain bool = false
 	// Send the bundle of transactions
 	resp, err := c.SendBundle(transactions, opts...)
 	if err != nil {
@@ -173,7 +174,6 @@ func (c *SearcherClient) SendBundleWithConfirmation(
 				*signature,
 			)
 			if err != nil {
-				log.Println("tx didn't land:", err)
 				additionalCheckDone <- nil
 				return
 			}
@@ -181,9 +181,19 @@ func (c *SearcherClient) SendBundleWithConfirmation(
 			if out.Value != nil {
 				confirmed := false
 				for _, status := range out.Value {
+					if status != nil && status.ConfirmationStatus == "processed" && !reachBlockChain {
+						reachBlockChain = true
+						log.Print("tx sent:", signature)
+					}
+
 					if status != nil && status.ConfirmationStatus == "confirmed" {
 						confirmed = true
 						break
+					}
+
+					if status != nil && status.Err != nil {
+						additionalCheckDone <- nil
+						return
 					}
 				}
 
@@ -211,9 +221,12 @@ func (c *SearcherClient) SendBundleWithConfirmation(
 		if res != nil {
 			return res, nil
 		}
+		return nil, fmt.Errorf("tx (%s) didn't land", signature)
 	case <-timeoutCtx.Done():
 		// If the timeout is reached, return an error
-		return nil, fmt.Errorf("BroadcastBundleWithConfirmation error: timeout exceeded")
+		if !reachBlockChain {
+			return nil, fmt.Errorf("BroadcastBundleWithConfirmation error: timeout exceeded")
+		}
 	}
 
 	// If both checks fail, return an error
