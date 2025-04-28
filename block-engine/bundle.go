@@ -17,7 +17,7 @@ import (
 // Constants for retry and timeout configurations
 const (
 	CheckBundleRetries               = 10               // Number of times to retry checking bundle status
-	CheckBundleRetryDelay            = 2 * time.Second  // Delay between retries for checking bundle status
+	CheckBundleRetryDelay            = 5 * time.Second  // Delay between retries for checking bundle status
 	SignaturesConfirmationTimeout    = 15 * time.Second // Timeout for confirming signatures
 	SignaturesConfirmationRetryDelay = 1 * time.Second  // Delay between retries for confirming signatures
 )
@@ -95,146 +95,158 @@ func (c *SearcherClient) SendBundleWithConfirmation(
 	signature *solana.Signature,
 	opts ...grpc.CallOption,
 ) (*BundleResponse, error) {
-	var reachBlockChain bool = false
 	// Send the bundle of transactions
 	resp, err := c.SendBundle(transactions, opts...)
 	if err != nil {
 		return nil, err
 	}
 
-	fmt.Printf("tx (%s) sent...", signature)
+	fmt.Printf("tx (%s) sent...\n", signature)
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	// Create channels to handle the normal check and additional check
+	// Create a timeout and a cancellation context
+	timeoutCtx, cancelTimeout := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelTimeout()
+
+	operationCtx, cancelOp := context.WithCancel(timeoutCtx)
+	defer cancelOp()
+
 	normalCheckDone := make(chan *BundleResponse, 1)
 	additionalCheckDone := make(chan *BundleResponse, 1)
 
-	// Start the normal check in a separate goroutine
+	// Start normal check
 	go func() {
 		for i := 0; i < CheckBundleRetries; i++ {
 			select {
-			case <-c.AuthenticationService.GRPCCtx.Done():
-				// If the GRPC context is done, return the error
-				normalCheckDone <- nil
+			case <-operationCtx.Done():
 				return
 			default:
-				// Wait for a configured delay before retrying
-				time.Sleep(CheckBundleRetryDelay)
+			}
 
-				// Attempt to receive the bundle result
-				bundleResult, err := c.receiveBundleResult()
-				if err != nil {
-					log.Println("error while receiving bundle result:", err)
-					normalCheckDone <- nil
-				} else {
-					// Handle the received bundle result
-					if err = c.handleBundleResult(bundleResult); err != nil {
-						if strings.Contains(err.Error(), "has already been processed") {
-							normalCheckDone <- &BundleResponse{
-								BundleResponse: resp,
-								Signatures:     pkg.BatchExtractSigFromTx(transactions),
-							}
-							return
-						}
-						normalCheckDone <- nil
+			time.Sleep(CheckBundleRetryDelay)
+
+			select {
+			case <-operationCtx.Done():
+				return
+			default:
+			}
+
+			bundleResult, err := c.receiveBundleResult()
+			if err != nil {
+				log.Println("[normalCheck] Error receiving bundle result:", err)
+				continue
+			}
+
+			if err = c.handleBundleResult(bundleResult); err != nil {
+				if strings.Contains(err.Error(), "has already been processed") {
+					normalCheckDone <- &BundleResponse{
+						BundleResponse: resp,
+						Signatures:     pkg.BatchExtractSigFromTx(transactions),
+					}
+					return
+				}
+				log.Println("[normalCheck] handleBundleResult error:", err)
+				normalCheckDone <- nil
+				return
+			}
+
+			statuses, err := c.waitForSignatureStatuses(operationCtx, transactions)
+			if err != nil {
+				log.Println("[normalCheck] Error waiting for signature statuses:", err)
+				continue
+			}
+
+			if err := pkg.ValidateSignatureStatuses(statuses); err != nil {
+				log.Println("[normalCheck] Signature status validation failed:", err)
+				continue
+			}
+
+			// Success
+			normalCheckDone <- &BundleResponse{
+				BundleResponse: resp,
+				Signatures:     pkg.BatchExtractSigFromTx(transactions),
+			}
+			return
+		}
+
+		// Retries exhausted
+		normalCheckDone <- nil
+	}()
+
+	// Start additional check (signature polling)
+	go func() {
+		for {
+			select {
+			case <-operationCtx.Done():
+				return
+			default:
+			}
+
+			time.Sleep(CheckBundleRetryDelay)
+
+			select {
+			case <-operationCtx.Done():
+				return
+			default:
+			}
+
+			out, err := c.RPCConn.GetSignatureStatuses(
+				operationCtx,
+				false,
+				*signature,
+			)
+			if err != nil {
+				log.Println("[additionalCheck] GetSignatureStatuses error:", err)
+				continue
+			}
+
+			if out.Value == nil || len(out.Value) == 0 || out.Value[0] == nil {
+				// No status yet
+				continue
+			}
+
+			confirmed := false
+			for _, status := range out.Value {
+				if status != nil {
+					if status.ConfirmationStatus == "confirmed" {
+						confirmed = true
+						break
+					}
+					if status.Err != nil {
+						// Transaction failed
+						additionalCheckDone <- nil
 						return
 					}
-					log.Println("Bundle was sent.")
 				}
+			}
 
-				// Wait for the statuses of the transaction signatures
-				statuses, err := c.waitForSignatureStatuses(ctx, transactions)
-				if err != nil {
-					continue
-				}
-
-				// Validate the received signature statuses
-				if err = pkg.ValidateSignatureStatuses(statuses); err != nil {
-					continue
-				}
-
-				// Return the successful bundle response with extracted signatures
-				normalCheckDone <- &BundleResponse{
+			if confirmed {
+				additionalCheckDone <- &BundleResponse{
 					BundleResponse: resp,
 					Signatures:     pkg.BatchExtractSigFromTx(transactions),
 				}
 				return
 			}
 		}
-		// If retries are exhausted, return nil
-		normalCheckDone <- nil
 	}()
 
-	go func() {
-		// Poll until confirmed
-		for {
-			// Check the signature status
-			out, err := c.RPCConn.GetSignatureStatuses(
-				ctx,
-				false,
-				*signature,
-			)
-			if err != nil {
-				additionalCheckDone <- nil
-				return
-			}
-
-			if out.Value != nil {
-				reachBlockChain = true
-				confirmed := false
-				for _, status := range out.Value {
-					if status != nil && status.ConfirmationStatus == "processed" && !reachBlockChain {
-						reachBlockChain = true
-					}
-
-					if status != nil && status.ConfirmationStatus == "confirmed" {
-						confirmed = true
-						break
-					}
-
-					if status != nil && status.Err != nil {
-						additionalCheckDone <- nil
-						return
-					}
-				}
-
-				if confirmed {
-					additionalCheckDone <- &BundleResponse{
-						BundleResponse: resp,
-						Signatures:     pkg.BatchExtractSigFromTx(transactions),
-					}
-					return
-				}
-			} else if len(out.Value) == 0 || out.Value[0] == nil {
-				additionalCheckDone <- nil
-				return
-			}
-
-			// Wait for a short delay before retrying
-			time.Sleep(CheckBundleRetryDelay)
-		}
-	}()
-
-	// Wait for either normal check or additional check to complete
+	// Wait for one of the checks or timeout
 	select {
 	case res := <-normalCheckDone:
 		if res != nil {
+			cancelOp()
 			return res, nil
 		}
 	case res := <-additionalCheckDone:
 		if res != nil {
+			cancelOp()
 			return res, nil
 		}
-		return nil, fmt.Errorf("tx (%s) didn't land", signature)
 	case <-timeoutCtx.Done():
-		// If the timeout is reached, return an error
-		if !reachBlockChain {
-			return nil, fmt.Errorf("BroadcastBundleWithConfirmation error: timeout exceeded")
-		}
+		cancelOp()
+		return nil, fmt.Errorf("BroadcastBundleWithConfirmation error: timeout exceeded")
 	}
 
-	// If both checks fail, return an error
+	// Fallback (should not normally reach here)
 	return nil, fmt.Errorf("BroadcastBundleWithConfirmation error: max retries (%d) exceeded", CheckBundleRetries)
 }
 
