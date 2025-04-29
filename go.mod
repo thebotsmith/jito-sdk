@@ -1,4 +1,4 @@
-module github.com/Prophet-Solutions/jito-sdk
+module github.com/thebotsmith/jito-sdk
 
 go 1.22.7
 
